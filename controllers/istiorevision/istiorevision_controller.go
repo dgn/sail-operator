@@ -19,7 +19,6 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
-	"regexp"
 
 	"github.com/go-logr/logr"
 	v1 "github.com/istio-ecosystem/sail-operator/api/v1"
@@ -27,6 +26,7 @@ import (
 	"github.com/istio-ecosystem/sail-operator/pkg/constants"
 	"github.com/istio-ecosystem/sail-operator/pkg/enqueuelogger"
 	"github.com/istio-ecosystem/sail-operator/pkg/errlist"
+	"github.com/istio-ecosystem/sail-operator/pkg/fieldignore"
 	"github.com/istio-ecosystem/sail-operator/pkg/helm"
 	"github.com/istio-ecosystem/sail-operator/pkg/kube"
 	predicate2 "github.com/istio-ecosystem/sail-operator/pkg/predicate"
@@ -63,6 +63,33 @@ const (
 	istioCniName = "default"
 	ztunnelName  = "default"
 )
+
+// DefaultFieldIgnoreRules defines the default set of fields to ignore on
+// resources managed by the operator. These prevent reconciliation loops caused
+// by other controllers (e.g. istiod) updating fields that the operator also
+// manages via Helm.
+var DefaultFieldIgnoreRules = fieldignore.MustCompileRules([]fieldignore.FieldIgnoreRule{
+	{
+		Group:        "admissionregistration.k8s.io",
+		Version:      "v1",
+		Kind:         "ValidatingWebhookConfiguration",
+		NameRegex:    "istiod-.*-validator|istio-validator.*",
+		Fields:       []string{"webhooks[*].failurePolicy"},
+		OnlyOnUpdate: true,
+	},
+	{
+		Group:   "admissionregistration.k8s.io",
+		Version: "v1",
+		Kind:    "ValidatingWebhookConfiguration",
+		Fields:  []string{"webhooks[*].clientConfig.caBundle"},
+	},
+	{
+		Group:   "admissionregistration.k8s.io",
+		Version: "v1",
+		Kind:    "MutatingWebhookConfiguration",
+		Fields:  []string{"webhooks[*].clientConfig.caBundle"},
+	},
+})
 
 // Reconciler reconciles an IstioRevision object
 type Reconciler struct {
@@ -312,9 +339,10 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// cluster-scoped resources
 		Watches(&rbacv1.ClusterRole{}, ownedResourceHandler, builder.WithPredicates(predicate2.IgnoreUpdateWhenAnnotation())).
 		Watches(&rbacv1.ClusterRoleBinding{}, ownedResourceHandler, builder.WithPredicates(predicate2.IgnoreUpdateWhenAnnotation())).
-		Watches(&admissionv1.MutatingWebhookConfiguration{}, ownedResourceHandler, builder.WithPredicates(predicate2.IgnoreUpdateWhenAnnotation())).
+		Watches(&admissionv1.MutatingWebhookConfiguration{}, ownedResourceHandler,
+			builder.WithPredicates(fieldignore.NewPredicate(r.Scheme, DefaultFieldIgnoreRules), predicate2.IgnoreUpdateWhenAnnotation())).
 		Watches(&admissionv1.ValidatingWebhookConfiguration{}, ownedResourceHandler,
-			builder.WithPredicates(validatingWebhookConfigPredicate(), predicate2.IgnoreUpdateWhenAnnotation())).
+			builder.WithPredicates(fieldignore.NewPredicate(r.Scheme, DefaultFieldIgnoreRules), predicate2.IgnoreUpdateWhenAnnotation())).
 
 		// +lint-watches:ignore: IstioCNI (not found in charts, but this controller needs to watch it to update the IstioRevision status)
 		Watches(&v1.IstioCNI{}, istioCniHandler).
@@ -739,36 +767,6 @@ func specWasUpdated(oldObject client.Object, newObject client.Object) bool {
 
 	// for other resources, comparing the metadata.generation suffices
 	return oldObject.GetGeneration() != newObject.GetGeneration()
-}
-
-func validatingWebhookConfigPredicate() predicate.Funcs {
-	return predicate.Funcs{
-		UpdateFunc: func(e event.TypedUpdateEvent[client.Object]) bool {
-			if e.ObjectOld == nil || e.ObjectNew == nil {
-				return false
-			}
-
-			if matched, _ := regexp.MatchString("istiod-.*-validator|istio-validator.*", e.ObjectNew.GetName()); matched {
-				// Istiod updates the caBundle and failurePolicy fields in istiod-<ns>-validator and istio-validator[-<rev>]-<ns>
-				// webhook configs. We must ignore changes to these fields to prevent an endless update loop.
-				clearIgnoredFields(e.ObjectOld)
-				clearIgnoredFields(e.ObjectNew)
-				return !reflect.DeepEqual(e.ObjectNew, e.ObjectOld)
-			}
-			return true
-		},
-	}
-}
-
-func clearIgnoredFields(obj client.Object) {
-	obj.SetResourceVersion("")
-	obj.SetGeneration(0)
-	obj.SetManagedFields(nil)
-	if webhookConfig, ok := obj.(*admissionv1.ValidatingWebhookConfiguration); ok {
-		for i := range len(webhookConfig.Webhooks) {
-			webhookConfig.Webhooks[i].FailurePolicy = nil
-		}
-	}
 }
 
 func wrapEventHandler(logger logr.Logger, handler handler.EventHandler) handler.EventHandler {
